@@ -48,18 +48,19 @@ app.post("/register/verify", async (req, res) => {
 
   try {
     const verification = await verifyRegistrationResponse({
-      credential: attestation,
+      response: attestation, // <-- use response (API expects "response")
       expectedChallenge: user.currentChallenge,
-      expectedOrigin: req.headers.origin,
-      expectedRPID: req.hostname,
+      expectedOrigin: "http://localhost:3000", // should match your frontend origin
+      expectedRPID: "localhost", // should match relying party ID
     });
 
     if (verification.verified) {
       const { credentialPublicKey, credentialID } =
         verification.registrationInfo;
+
       user.credentials.push({
-        credentialID: base64url.encode(newCredential.credentialID), 
-        credentialPublicKey: newCredential.credentialPublicKey,
+        credentialID: base64url.encode(credentialID),
+        credentialPublicKey,
       });
     }
 
