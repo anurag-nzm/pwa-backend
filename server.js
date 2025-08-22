@@ -1,113 +1,181 @@
-const express = require("express");
-const cors = require("cors");
+const express = require('express');
+const bodyParser = require('body-parser');
 const {
   generateRegistrationOptions,
   verifyRegistrationResponse,
   generateAuthenticationOptions,
   verifyAuthenticationResponse,
-} = require("@simplewebauthn/server");
-const base64url = require("base64url");
+} = require('@simplewebauthn/server');
+const cors = require("cors");
+const { webcrypto } = require("crypto");
 
+if (!globalThis.crypto) {
+  globalThis.crypto = webcrypto;
+}
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(bodyParser.json());
 
-const users = {}; 
+// In-memory user store (replace with DB in production)
+const usersDB = {}; // { username: { passkeys: [], currentRegOpts, currentAuthOpts } }
+
+// ------------------------
+// Helper functions
+// ------------------------
+function getUser(username) {
+  return usersDB[username] || null;
+}
+
+function createUser(username) {
+  usersDB[username] = { username, passkeys: [] };
+  return usersDB[username];
+}
+
+function getRPInfo(req) {
+  const origin = req.headers.origin || 'http://localhost:3000';
+  const rpID = new URL(origin).hostname || 'localhost';
+  const rpName = rpID; // or any friendly name
+  return { origin, rpID, rpName };
+}
 
 
-const getUser = (username) => {
-  if (!users[username])
-    users[username] = {
-      id: `${Date.now()}`,
-      credentials: [],
-      currentChallenge: null,
-    };
-  return users[username];
-};
-
-
-app.post("/register/options", async (req, res) => {
+// ------------------------
+// 1. Generate Registration Options
+// ------------------------
+app.post('/register/options',async (req, res) => {
   const { username } = req.body;
-  const user = getUser(username);
-  const options = await generateRegistrationOptions({
-    rpName: "PWA POC",
-    userID: base64url.encode(user.id),
-    userName: username,
-    attestationType: "none",
-    authenticatorSelection: { userVerification: "preferred" },
-  });
+  if (!username) return res.status(400).json({ error: 'Missing username' });
 
-  user.currentChallenge = options.challenge;
-  res.json(options);
+  let user = getUser(username) || createUser(username);
+  const { origin, rpID, rpName } = getRPInfo(req);
+
+  const options = await generateRegistrationOptions({
+    rpName,
+    rpID,
+    userName: user.username,
+    attestationType: 'none',
+    excludeCredentials: user.passkeys.map(pk => ({
+      id: pk.id,
+      transports: pk.transports,
+    })),
+    authenticatorSelection: {
+      residentKey: 'preferred',
+      userVerification: 'preferred',
+      authenticatorAttachment: 'platform',
+    },
+  });
+  console.log("options",options)
+  user.currentRegOpts = options;
+  return res.json(options);
 });
 
-
-app.post("/register/verify", async (req, res) => {
+// ------------------------
+// 2. Verify Registration Response
+// ------------------------
+app.post('/register/verify', async(req, res) => {
   const { username, attestation } = req.body;
+  if (!username || !attestation) {
+    return res.status(400).json({ error: 'Missing parameters' });
+  }
+
   const user = getUser(username);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const { origin, rpID } = getRPInfo(req);
 
   try {
     const verification = await verifyRegistrationResponse({
-      response: attestation, // <-- use response (API expects "response")
-      expectedChallenge: user.currentChallenge,
-      expectedOrigin: "http://localhost:3000", // should match your frontend origin
-      expectedRPID: "localhost", // should match relying party ID
+      response: attestation,
+      expectedChallenge: user.currentRegOpts.challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
     });
 
-    if (verification.verified) {
-      const { credentialPublicKey, credentialID } =
-        verification.registrationInfo;
-
-      user.credentials.push({
-        credentialID: base64url.encode(credentialID),
-        credentialPublicKey,
+    const { verified, registrationInfo } = verification;
+    if (verified && registrationInfo) {
+      const { id, publicKey, counter, transports } = registrationInfo.credential;
+      user.passkeys.push({
+        id,
+        publicKey,
+        counter,
+        transports,
       });
     }
 
-    res.json({ verified: verification.verified });
+    return res.json({ verified });
   } catch (err) {
     console.error(err);
-    res.status(400).json({ error: err.message });
+    return res.status(400).json({ error: err.message });
   }
 });
 
-
-app.post("/login/options", (req, res) => {
+// ------------------------
+// 3. Generate Authentication Options
+// ------------------------
+app.post('/login/options', async (req, res) => {
   const { username } = req.body;
-  const user = getUser(username);
+  if (!username) return res.status(400).json({ error: 'Missing parameters' });
 
-  const options = generateAuthenticationOptions({
-    allowCredentials: user.credentials.map((c) => ({
-      id: c.credentialID,
-      type: "public-key",
-      transports: ["internal"],
+  const user = getUser(username);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const { rpID } = getRPInfo(req);
+  console.log(rpID)
+  console.log(user)
+  const options = await generateAuthenticationOptions({
+    rpID,
+    allowCredentials: user.passkeys.map(pk => ({
+      id: pk.id,
+      transports: pk.transports,
     })),
-    userVerification: "preferred",
   });
 
-  user.currentChallenge = options.challenge;
-  res.json(options);
+  user.currentAuthOpts = options;
+  return res.json(options);
 });
 
-
-app.post("/login/verify", async (req, res) => {
+// ------------------------
+// 4. Verify Authentication Response
+// ------------------------
+app.post('/login/verify', async(req, res) => {
   const { username, assertion } = req.body;
+  if (!username || !assertion) return res.status(400).json({ error: 'Missing parameters' });
+
+
   const user = getUser(username);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const { origin, rpID } = getRPInfo(req);
+
+  const passkey = user.passkeys.find(pk => pk.id === assertion.id);
+  if (!passkey) return res.status(400).json({ error: 'Passkey not found' });
 
   try {
     const verification = await verifyAuthenticationResponse({
-      credential: assertion,
-      expectedChallenge: user.currentChallenge,
-      expectedOrigin: req.headers.origin,
-      expectedRPID: req.hostname,
-      authenticator: user.credentials[0], 
+      response: assertion,
+      expectedChallenge: user.currentAuthOpts.challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      credential: {
+        id: passkey.id,
+        publicKey: passkey.publicKey,
+        counter: passkey.counter,
+        transports: passkey.transports,
+      },
     });
 
-    res.json({ verified: verification.verified });
+    const { verified, authenticationInfo } = verification;
+
+    if (verified && authenticationInfo) {
+      passkey.counter = authenticationInfo.newCounter;
+    }
+
+    return res.json({ verified });
   } catch (err) {
     console.error(err);
-    res.status(400).json({ error: err.message });
+    return res.status(400).json({ error: err.message });
   }
 });
 
-app.listen(4000, () => console.log("Backend running on http"))
+// ------------------------
+app.listen(4000, () => console.log('WebAuthn server running on http://localhost:4000'));

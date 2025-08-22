@@ -11,7 +11,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@simplewebauthn/server": "^9.0.3",
+    "@simplewebauthn/server": "^13.1.2",
     "base64url": "^3.0.1",
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
