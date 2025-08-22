@@ -109,4 +109,4 @@ app.post("/login/verify", async (req, res) => {
   }
 });
 
-app.listen(4000, () => console.log("Backend running on http:
+app.listen(4000, () => console.log("Backend running on http"))
